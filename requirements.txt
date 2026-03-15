@@ -1,4 +1,15 @@
+# Core dependencies
+boto3
+pydub
+ifnude
+opencv-python
+openai-whisper
 textual
 textual-dev
 textual-mcp-server
 typer
+pyyaml
+
+# Testing
+pytest
+pytest-cov
