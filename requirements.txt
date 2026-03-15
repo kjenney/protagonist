@@ -1,0 +1,4 @@
+textual
+textual-dev
+textual-mcp-server
+typer

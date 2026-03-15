@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "textual": {
+      "command": "textual-mcp"
+    }
+  }
+}
