@@ -6,9 +6,18 @@ from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
+from enum import Enum
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Header, Footer, DataTable
+from textual.containers import Horizontal, Vertical
+from textual.message import Message
+from textual.reactive import reactive
+from textual.widget import Widget
+from textual.widgets import (
+    Button, Footer, Header, Input, Label,
+    ListItem, ListView, RichLog, Select, Static,
+)
 
 _SRC = Path(__file__).parent / "src"
 if str(_SRC) not in sys.path:
@@ -109,17 +118,300 @@ OutputDirOpt = Annotated[Optional[Path], typer.Option("--output-dir", "-o", help
 # TUI
 # ---------------------------------------------------------------------------
 
+class StepStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE    = "done"
+    ERROR   = "error"
+
+_STATUS_STYLE = {
+    StepStatus.PENDING: ("[ ]", "dim"),
+    StepStatus.RUNNING: ("[~]", "bold yellow"),
+    StepStatus.DONE:    ("[✓]", "bold green"),
+    StepStatus.ERROR:   ("[✗]", "bold red"),
+}
+
+_PIPELINE_STEPS = [
+    "1. Detect",
+    "2. Transcribe",
+    "3. Regex Matching",
+    "4. Subtitles",
+    "5. Polly Synthesis",
+    "6. Combine",
+]
+
+_BACKENDS = [("Whisper (local)", "whisper"), ("AWS Transcribe", "aws-transcribe")]
+_VOICES   = [(v, v) for v in ["Joanna", "Matthew", "Amy", "Brian", "Emma", "Russell"]]
+
+
+class PipelineStepItem(ListItem):
+    """Single pipeline step row with live status indicator."""
+
+    status: reactive[StepStatus] = reactive(StepStatus.PENDING)
+
+    def __init__(self, step_name: str, step_index: int) -> None:
+        super().__init__(id=f"step-{step_index}")
+        self.step_name = step_name
+        self.step_index = step_index
+
+    def compose(self) -> ComposeResult:
+        icon, _ = _STATUS_STYLE[StepStatus.PENDING]
+        yield Label(f"{icon} {self.step_name}", id=f"step-label-{self.step_index}")
+
+    def watch_status(self, status: StepStatus) -> None:
+        icon, style = _STATUS_STYLE[status]
+        self.query_one(Label).update(f"[{style}]{icon} {self.step_name}[/]")
+
+
 class Protagonist(App):
+    CSS_PATH = "app.tcss"
+
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit"),
-        Binding("q", "quit", "Quit"),
-        Binding("escape", "quit", "Quit"),
+        Binding("ctrl+r", "run_pipeline",  "Run",  show=True),
+        Binding("ctrl+c", "quit",          "Quit", show=True),
     ]
+
+    # Messages -----------------------------------------------------------
+
+    class StepStarted(Message):
+        def __init__(self, index: int) -> None:
+            self.index = index
+            super().__init__()
+
+    class StepDone(Message):
+        def __init__(self, index: int) -> None:
+            self.index = index
+            super().__init__()
+
+    class StepFailed(Message):
+        def __init__(self, index: int, error: str) -> None:
+            self.index = index
+            self.error = error
+            super().__init__()
+
+    # Layout -------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield DataTable()
+        with Horizontal(id="main"):
+            with Vertical(id="left-panel"):
+                yield Static("Video Pipeline", id="panel-title")
+                yield Input(placeholder="Video path...", id="video-path")
+                yield Input(placeholder="Rules file (regex.yaml)...", id="rules-path")
+                yield Select(_BACKENDS, prompt="Backend", id="backend-select", value="whisper")
+                yield Select(_VOICES,   prompt="Polly voice", id="voice-select", value="Joanna")
+                yield Input(placeholder="Output dir (optional)...", id="output-dir")
+                with Horizontal(id="btn-row"):
+                    yield Button("▶  Run", id="btn-run", variant="success")
+                    yield Button("■  Stop", id="btn-stop", variant="error")
+                yield ListView(
+                    *[PipelineStepItem(name, i) for i, name in enumerate(_PIPELINE_STEPS)],
+                    id="step-list",
+                )
+            with Vertical(id="right-panel"):
+                yield Static("Output Log", id="log-title")
+                yield RichLog(highlight=True, markup=True, id="log", max_lines=2000, wrap=True)
         yield Footer()
+
+    # Event handlers -----------------------------------------------------
+
+    @on(Button.Pressed, "#btn-run")
+    def on_run(self, _: Button.Pressed) -> None:
+        self.action_run_pipeline()
+
+    @on(Button.Pressed, "#btn-stop")
+    def on_stop(self, _: Button.Pressed) -> None:
+        self.workers.cancel_all()
+        self._log("[yellow]Pipeline stopped by user.[/]")
+
+    @on(StepStarted)
+    def handle_started(self, msg: "Protagonist.StepStarted") -> None:
+        self.query_one(f"#step-{msg.index}", PipelineStepItem).status = StepStatus.RUNNING
+
+    @on(StepDone)
+    def handle_done(self, msg: "Protagonist.StepDone") -> None:
+        self.query_one(f"#step-{msg.index}", PipelineStepItem).status = StepStatus.DONE
+
+    @on(StepFailed)
+    def handle_failed(self, msg: "Protagonist.StepFailed") -> None:
+        self.query_one(f"#step-{msg.index}", PipelineStepItem).status = StepStatus.ERROR
+        self._log(f"[bold red]Step failed: {msg.error}[/]")
+
+    # Actions ------------------------------------------------------------
+
+    def action_run_pipeline(self) -> None:
+        video_val   = self.query_one("#video-path",    Input).value.strip()
+        rules_val   = self.query_one("#rules-path",    Input).value.strip()
+        output_val  = self.query_one("#output-dir",    Input).value.strip()
+        backend_val = self.query_one("#backend-select", Select).value
+        voice_val   = self.query_one("#voice-select",   Select).value
+
+        if backend_val is Select.BLANK:
+            backend_val = "whisper"
+        if voice_val is Select.BLANK:
+            voice_val = "Joanna"
+
+        if not video_val:
+            self._log("[red]Error: video path is required.[/]")
+            return
+
+        # Reset step statuses
+        for i in range(len(_PIPELINE_STEPS)):
+            self.query_one(f"#step-{i}", PipelineStepItem).status = StepStatus.PENDING
+
+        self.query_one("#log", RichLog).clear()
+        self._run_pipeline_worker(
+            video=video_val,
+            rules=rules_val or None,
+            backend=str(backend_val),
+            voice=str(voice_val),
+            output_dir=output_val or None,
+        )
+
+    # Worker -------------------------------------------------------------
+
+    @work(thread=True)
+    def _run_pipeline_worker(
+        self,
+        video: str,
+        rules: Optional[str],
+        backend: str,
+        voice: str,
+        output_dir: Optional[str],
+    ) -> None:
+        video_path  = Path(video)
+        rules_path  = Path(rules) if rules else None
+        out_dir     = Path(output_dir) if output_dir else None
+
+        if out_dir:
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+        loaded_rules = _load_rules(rules_path) if rules_path else []
+
+        def start(i: int) -> None:
+            self.app.post_message(Protagonist.StepStarted(i))
+
+        def done(i: int) -> None:
+            self.app.post_message(Protagonist.StepDone(i))
+
+        def fail(i: int, err: str) -> None:
+            self.app.post_message(Protagonist.StepFailed(i, err))
+
+        def log(msg: str) -> None:
+            self.call_from_thread(self.query_one("#log", RichLog).write, msg)
+
+        # [1] Detect
+        start(0)
+        combined = []
+        if not _detector_available:
+            log("[yellow]Detector deps missing — skipping detection.[/]")
+            done(0)
+        else:
+            try:
+                log("Running content detection...")
+                classes = EXPLICIT_CLASSES
+                ifnude_r, rekog_r = [], []
+                ifnude_r   = ifnude_detect_video(str(video_path), 0.5, classes, 30)
+                rekog_r    = rekognition_detect_video(str(video_path), 0.5, None, 30)
+                combined   = combine_results(ifnude_r, rekog_r, is_video=True)
+                det_path   = _out_path(video_path, ".detections.json", out_dir)
+                det_path.write_text(json.dumps(combined, indent=2), encoding="utf-8")
+                log(f"  -> {det_path}")
+                done(0)
+            except Exception as e:
+                fail(0, str(e))
+                return
+
+        # [2] Transcribe
+        start(1)
+        tmp_dir    = tempfile.mkdtemp()
+        audio_path = str(Path(tmp_dir) / f"{video_path.stem}.wav")
+        words      = []
+        try:
+            log(f"Extracting audio and transcribing with '{backend}'...")
+            extract_audio(str(video_path), audio_path)
+            words = transcribe_audio(audio_path, backend=backend)
+            txt_path = _out_path(video_path, ".txt", out_dir)
+            txt_path.write_text(words_to_text(words), encoding="utf-8")
+            log(f"  -> {txt_path}")
+            done(1)
+        except Exception as e:
+            fail(1, str(e))
+            return
+        finally:
+            Path(audio_path).unlink(missing_ok=True)
+
+        # [3] Regex matching
+        start(2)
+        try:
+            log("Applying regex rules...")
+            analysis     = combine_with_detections(combined, words, is_video=True, rules=loaded_rules)
+            analysis_path = _out_path(video_path, ".analysis.json", out_dir)
+            analysis_path.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
+            frames   = analysis.get("frames", [])
+            entries  = frames_to_subtitle_entries(frames)
+            snip_path = _out_path(video_path, ".snippets.txt", out_dir)
+            snip_path.write_text("\n".join(e["text"] for e in entries), encoding="utf-8")
+            log(f"  -> {analysis_path}, {snip_path} ({len(entries)} snippet(s))")
+            done(2)
+        except Exception as e:
+            fail(2, str(e))
+            return
+
+        # [4] Subtitles
+        start(3)
+        try:
+            log("Generating subtitles...")
+            srt_path = _out_path(video_path, ".srt", out_dir)
+            vtt_path = _out_path(video_path, ".vtt", out_dir)
+            srt_path.write_text(generate_srt(frames), encoding="utf-8")
+            vtt_path.write_text(generate_vtt(frames), encoding="utf-8")
+            log(f"  -> {srt_path}, {vtt_path}")
+            done(3)
+        except Exception as e:
+            fail(3, str(e))
+            return
+
+        # [5] Polly synthesis
+        start(4)
+        mp3_path = None
+        if not entries:
+            log("[yellow]No snippets — skipping Polly synthesis.[/]")
+            done(4)
+        else:
+            try:
+                log(f"Synthesizing audio with Polly voice '{voice}'...")
+                tmp_mp3  = synthesize_subtitles(entries, voice_id=voice)
+                mp3_path = _out_path(video_path, ".mp3", out_dir)
+                shutil.move(tmp_mp3, str(mp3_path))
+                log(f"  -> {mp3_path}")
+                done(4)
+            except Exception as e:
+                fail(4, str(e))
+                return
+
+        # [6] Combine
+        start(5)
+        if not mp3_path:
+            log("[yellow]No audio — skipping combine.[/]")
+            done(5)
+        else:
+            try:
+                log("Combining video with audio and subtitles...")
+                out_video = _out_path(video_path, ".output" + video_path.suffix, out_dir)
+                _combine_video_audio(video_path, mp3_path, out_video, srt=srt_path)
+                log(f"  -> {out_video}")
+                done(5)
+            except Exception as e:
+                fail(5, str(e))
+                return
+
+        log("[bold green]Pipeline complete![/]")
+
+    # Helper -------------------------------------------------------------
+
+    def _log(self, msg: str) -> None:
+        self.query_one("#log", RichLog).write(msg)
 
 
 @app_cli.command()

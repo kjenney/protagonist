@@ -1,0 +1,76 @@
+Screen {
+    layout: vertical;
+}
+
+#main {
+    layout: horizontal;
+    height: 1fr;
+}
+
+/* ── Left panel ─────────────────────────────────────────────────────── */
+
+#left-panel {
+    width: 36;
+    min-width: 32;
+    height: 100%;
+    layout: vertical;
+    padding: 1 1;
+    border-right: solid $primary-darken-2;
+}
+
+#panel-title {
+    text-style: bold;
+    color: $accent;
+    padding-bottom: 1;
+}
+
+#left-panel Input {
+    margin-bottom: 1;
+}
+
+#left-panel Select {
+    margin-bottom: 1;
+}
+
+#btn-row {
+    layout: horizontal;
+    height: auto;
+    margin-bottom: 1;
+}
+
+#btn-run {
+    width: 1fr;
+    margin-right: 1;
+}
+
+#btn-stop {
+    width: 1fr;
+}
+
+#step-list {
+    height: 1fr;
+    border: solid $surface-lighten-2;
+    padding: 0;
+}
+
+/* ── Right panel ─────────────────────────────────────────────────────── */
+
+#right-panel {
+    width: 1fr;
+    height: 100%;
+    layout: vertical;
+    padding: 1 1;
+}
+
+#log-title {
+    text-style: bold;
+    color: $accent;
+    padding-bottom: 1;
+}
+
+#log {
+    height: 1fr;
+    border: solid $surface-lighten-2;
+    padding: 0 1;
+    overflow-y: auto;
+}
